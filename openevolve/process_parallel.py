@@ -8,6 +8,7 @@ import multiprocessing as mp
 import pickle
 import signal
 import time
+import uuid
 from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import asdict, dataclass
@@ -16,6 +17,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from openevolve.config import Config
 from openevolve.database import Program, ProgramDatabase
+from openevolve.fitness.evidence import build_program_evidence
+from openevolve.fitness.events import FitnessEventWriter
+from openevolve.fitness.queue import PendingScoringQueue
+from openevolve.fitness.strategy import FitnessContext, create_fitness_strategy
 from openevolve.utils.metrics_utils import safe_numeric_average
 
 logger = logging.getLogger(__name__)
@@ -53,9 +58,11 @@ def _worker_init(config_dict: dict, evaluation_file: str, parent_env: dict = Non
     # Store config for later use
     # Reconstruct Config object from nested dictionaries
     from openevolve.config import (
+        AgenticFitnessConfig,
         Config,
         DatabaseConfig,
         EvaluatorConfig,
+        FitnessConfig,
         LLMConfig,
         LLMModelConfig,
         PromptConfig,
@@ -75,16 +82,22 @@ def _worker_init(config_dict: dict, evaluation_file: str, parent_env: dict = Non
     prompt_config = PromptConfig(**config_dict["prompt"])
     database_config = DatabaseConfig(**config_dict["database"])
     evaluator_config = EvaluatorConfig(**config_dict["evaluator"])
+    fitness_agentic = AgenticFitnessConfig(**config_dict.get("fitness", {}).get("agentic", {}))
+    fitness_config = FitnessConfig(
+        algo=config_dict.get("fitness", {}).get("algo", "default"),
+        agentic=fitness_agentic,
+    )
 
     _worker_config = Config(
         llm=llm_config,
         prompt=prompt_config,
         database=database_config,
         evaluator=evaluator_config,
+        fitness=fitness_config,
         **{
             k: v
             for k, v in config_dict.items()
-            if k not in ["llm", "prompt", "database", "evaluator"]
+            if k not in ["llm", "prompt", "database", "evaluator", "fitness"]
         },
     )
     _worker_evaluation_file = evaluation_file
@@ -352,6 +365,21 @@ class ProcessParallelController:
         self.executor: Optional[ProcessPoolExecutor] = None
         self.shutdown_event = mp.Event()
         self.early_stopping_triggered = False
+        self.run_id = uuid.uuid4().hex
+        event_dir = config.fitness.agentic.research_events_path or config.log_dir
+        if event_dir is None and config.database.db_path:
+            event_dir = str(Path(config.database.db_path) / "fitness_events")
+        self.fitness_event_writer = (
+            FitnessEventWriter(event_dir, run_id=self.run_id)
+            if event_dir and config.fitness.agentic.dump_research_events
+            else None
+        )
+        self.fitness_strategy = create_fitness_strategy(
+            config,
+            llm_client=None,
+            event_writer=self.fitness_event_writer,
+        )
+        self.pending_scoring_queue = PendingScoringQueue()
 
         # Number of worker processes
         self.num_workers = config.evaluator.parallel_evaluations
@@ -382,6 +410,7 @@ class ProcessParallelController:
             "prompt": asdict(config.prompt),
             "database": asdict(config.database),
             "evaluator": asdict(config.evaluator),
+            "fitness": asdict(config.fitness),
             "max_iterations": config.max_iterations,
             "checkpoint_interval": config.checkpoint_interval,
             "log_level": config.log_level,
@@ -391,7 +420,62 @@ class ProcessParallelController:
             "max_code_length": config.max_code_length,
             "language": config.language,
             "file_suffix": self.file_suffix,
+            "early_stopping_patience": config.early_stopping_patience,
+            "convergence_threshold": config.convergence_threshold,
+            "early_stopping_metric": config.early_stopping_metric,
         }
+
+    def should_run_research_rerank(self, iteration: int) -> bool:
+        cfg = self.config.fitness.agentic
+        if self.config.fitness.algo != "agentic" or not cfg.enabled:
+            return False
+        if cfg.mode not in {"batch_research", "hybrid"}:
+            return False
+        if len(self.pending_scoring_queue) < cfg.research_rerank_min_pending:
+            return False
+        return iteration % cfg.research_rerank_interval == 0
+
+    async def _maybe_run_research_rerank(self, iteration: int):
+        if not self.should_run_research_rerank(iteration):
+            return None
+        context = FitnessContext(
+            iteration=iteration,
+            run_id=self.run_id,
+            task_name=None,
+            problem_class=None,
+            target_island=None,
+            database=self.database,
+            config=self.config,
+            pending_program_ids=self.pending_scoring_queue.as_list(),
+        )
+        epoch = await self.fitness_strategy.maybe_run_research_rerank(context)
+        if epoch is None:
+            return None
+        self.database.apply_score_epoch(epoch)
+        pending_ids = set(self.pending_scoring_queue.as_list())
+        active_ids = set().union(*self.database.islands) if self.database.islands else set()
+        if self.config.fitness.agentic.mode == "batch_research":
+            for program_id in epoch.program_ids:
+                if program_id in pending_ids and program_id not in active_ids:
+                    program = self.database.get(program_id)
+                    if program is not None:
+                        self.database.add(
+                            program,
+                            iteration=program.iteration_found,
+                            target_island=program.metadata.get("island"),
+                        )
+        if self.fitness_event_writer:
+            for update in epoch.updates:
+                self.fitness_event_writer.write_score_update(update)
+        if self.config.fitness.agentic.rebuild_map_elites_after_research:
+            self.database.rebuild_map_elites_from_scores(score_key="combined_score")
+        self.pending_scoring_queue.remove_many(set(epoch.program_ids))
+        logger.info(
+            "Applied agentic fitness score epoch %s to %d programs",
+            epoch.epoch_id,
+            len(epoch.updates),
+        )
+        return epoch
 
     def start(self) -> None:
         """Start the process pool"""
@@ -558,19 +642,61 @@ class ProcessParallelController:
                 elif result.child_program_dict:
                     # Reconstruct program from dict
                     child_program = Program(**result.child_program_dict)
-
-                    # Add to database with explicit target_island to ensure proper island placement
-                    # This fixes issue #391: children should go to the target island, not inherit
-                    # from the parent (which may be from a different island due to fallback sampling)
-                    self.database.add(
-                        child_program,
-                        iteration=completed_iteration,
-                        target_island=result.target_island,
+                    fitness_enabled = (
+                        self.config.fitness.algo == "agentic"
+                        and self.config.fitness.agentic.enabled
                     )
+                    fitness_mode = self.config.fitness.agentic.mode
+                    target_island = result.target_island
+                    if target_island is not None:
+                        child_program.metadata["island"] = target_island
+
+                    if fitness_enabled:
+                        evidence = build_program_evidence(
+                            program=child_program,
+                            evaluation_result=child_program.metrics,
+                            database=self.database,
+                            config=self.config,
+                            iteration=completed_iteration,
+                        )
+                        child_program.metadata["program_evidence"] = evidence.to_dict()
+                        if self.fitness_event_writer:
+                            self.fitness_event_writer.write_program_evidence(evidence)
+
+                    if fitness_enabled and fitness_mode in {"local_insert", "hybrid"}:
+                        context = FitnessContext(
+                            iteration=completed_iteration,
+                            run_id=self.run_id,
+                            task_name=None,
+                            problem_class=None,
+                            target_island=target_island,
+                            database=self.database,
+                            config=self.config,
+                        )
+                        child_program = await self.fitness_strategy.score_child(
+                            child_program, context
+                        )
+
+                    if not fitness_enabled or fitness_mode in {"local_insert", "hybrid"}:
+                        # Add to database with explicit target_island to ensure proper island placement.
+                        self.database.add(
+                            child_program,
+                            iteration=completed_iteration,
+                            target_island=target_island,
+                        )
+                    else:
+                        # Strict batch mode keeps the program available for evidence/reranking
+                        # but out of MAP-Elites until a score epoch is applied.
+                        child_program.iteration_found = completed_iteration
+                        self.database.programs[child_program.id] = child_program
 
                     # Store artifacts
                     if result.artifacts:
                         self.database.store_artifacts(child_program.id, result.artifacts)
+
+                    if fitness_enabled and fitness_mode in {"batch_research", "hybrid"}:
+                        self.pending_scoring_queue.add(child_program.id)
+                        await self._maybe_run_research_rerank(completed_iteration)
 
                     # Log evolution trace
                     if self.evolution_tracer:
@@ -620,7 +746,16 @@ class ProcessParallelController:
                     # Check migration
                     if self.database.should_migrate():
                         logger.info(f"Performing migration at iteration {completed_iteration}")
-                        self.database.migrate_programs()
+                        migrated_program_ids = self.database.migrate_programs()
+                        if (
+                            self.config.fitness.algo == "agentic"
+                            and self.config.fitness.agentic.enabled
+                            and self.config.fitness.agentic.mode in {"batch_research", "hybrid"}
+                            and self.config.fitness.agentic.rescore_migrants
+                        ):
+                            for program_id in migrated_program_ids:
+                                self.pending_scoring_queue.add(program_id)
+                            await self._maybe_run_research_rerank(completed_iteration)
                         self.database.log_island_status()
 
                     # Log progress

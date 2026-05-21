@@ -1,0 +1,6 @@
+Rerank these program evidence cards across the current score epoch.
+
+Cards:
+{program_cards}
+
+Return JSON with research_summary, fitness_functions, ensemble, normalization, rankings, pairwise_preferences, and apply_score_updates.

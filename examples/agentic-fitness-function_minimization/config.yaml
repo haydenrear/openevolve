@@ -1,0 +1,63 @@
+# Configuration for agentic-fitness function minimization smoke run
+max_iterations: 6
+checkpoint_interval: 2
+log_dir: "./logs"
+
+# LLM configuration
+llm:
+  primary_model: "GEMINI_gemini-2.5-flash"
+  primary_model_weight: 1.0
+  api_base: "http://127.0.0.1:8091/v1"
+  temperature: 0.7
+  max_tokens: 16000
+  timeout: 120
+  retries: 0
+
+# Prompt configuration
+prompt:
+  system_message: "You are an expert programmer specializing in optimization algorithms. Your task is to improve a function minimization algorithm to find the global minimum of a complex function with many local minima. The function is f(x, y) = sin(x) * cos(y) + sin(x*y) + (x^2 + y^2)/20. Focus on improving the search_algorithm function to reliably find the global minimum, escaping local minima that might trap simple algorithms."
+
+# Database configuration
+database:
+  population_size: 50
+  archive_size: 20
+  num_islands: 3
+  elite_selection_ratio: 0.2
+  exploitation_ratio: 0.7
+
+  # embedding_model: "text-embedding-3-small"
+  similarity_threshold: 0.99
+
+# Evaluator configuration
+evaluator:
+  timeout: 60
+  cascade_thresholds: [1.3]
+  parallel_evaluations: 1
+
+# Evolution settings
+diff_based_evolution: true
+max_code_length: 20000
+
+fitness:
+  algo: agentic
+  agentic:
+    enabled: true
+    mode: hybrid
+    model: "GEMINI_gemini-2.5-flash"
+    temperature: 0.0
+    research_rerank_interval: 2
+    research_rerank_min_pending: 2
+    research_scope: all_retained
+    research_top_k_per_island: 4
+    research_include_archive: true
+    research_include_cell_incumbents: true
+    research_include_pending_children: true
+    research_max_programs: 12
+    normalization_method: rank_percentile
+    rewrite_combined_score: true
+    rebuild_map_elites_after_research: true
+    dump_research_events: true
+    research_events_path: "./fitness_events"
+    acp-cdc-ai-python: true
+    acp_cdc_ai_python_base_url: "http://127.0.0.1:8091/v1"
+    acp_cdc_ai_python_cwd: "/Users/hayde/IdeaProjects/openevolve/examples/agentic-fitness-function_minimization"

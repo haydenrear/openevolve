@@ -65,7 +65,7 @@ class OpenAILLM(LLMInterface):
         self.reasoning_effort = getattr(model_cfg, "reasoning_effort", None)
 
         # Manual mode: enabled via llm.manual_mode in config.yaml
-        self.manual_mode = (getattr(model_cfg, "manual_mode", False) is True)
+        self.manual_mode = getattr(model_cfg, "manual_mode", False) is True
         self.manual_queue_dir: Optional[Path] = None
 
         if self.manual_mode:
@@ -187,10 +187,16 @@ class OpenAILLM(LLMInterface):
             return await self._manual_wait_for_answer(params, timeout=timeout)
 
         timeout = kwargs.get("timeout", self.timeout)
+        harness_greeting = kwargs.get("harness_greeting")
 
         for attempt in range(retries + 1):
             try:
-                response = await asyncio.wait_for(self._call_api(params), timeout=timeout)
+                if harness_greeting:
+                    response = await asyncio.wait_for(
+                        self._call_harness_api(params, harness_greeting), timeout=timeout
+                    )
+                else:
+                    response = await asyncio.wait_for(self._call_api(params), timeout=timeout)
                 return response
             except asyncio.TimeoutError:
                 if attempt < retries:
@@ -222,6 +228,57 @@ class OpenAILLM(LLMInterface):
         # Logging of system prompt, user message and response content
         logger = logging.getLogger(__name__)
         logger.debug(f"API parameters: {params}")
+        logger.debug(f"API response: {response.choices[0].message.content}")
+        return response.choices[0].message.content
+
+    async def _call_harness_api(
+        self, params: Dict[str, Any], harness_greeting: Dict[str, Any]
+    ) -> str:
+        """Create a fresh ACP harness session, then pin the follow-up chat turn."""
+        if self.client is None:
+            raise RuntimeError("OpenAI client is not initialized (manual_mode enabled?)")
+
+        formatted_messages = list(params.get("messages", []))
+        if not formatted_messages:
+            raise ValueError("Harness greeting requires at least one message")
+
+        working_directory = harness_greeting.get("working_directory") or harness_greeting.get("cwd")
+        if not working_directory:
+            raise ValueError("Harness greeting requires working_directory or cwd")
+
+        greeting_body = {
+            "model": params["model"],
+            "messages": formatted_messages,
+            "stream": False,
+            "working_directory": str(working_directory),
+            "env": dict(harness_greeting.get("env") or {}),
+            "mcp_servers": list(harness_greeting.get("mcp_servers") or []),
+        }
+
+        loop = asyncio.get_event_loop()
+        greeting = await loop.run_in_executor(
+            None,
+            lambda: self.client.post(
+                "/harness-greeting",
+                cast_to=Dict[str, Any],
+                body=greeting_body,
+            ),
+        )
+        conversation_id = greeting.get("conversation_id")
+        if not conversation_id:
+            raise RuntimeError("Harness greeting response did not include conversation_id")
+
+        followup_params = dict(params)
+        followup_params["messages"] = formatted_messages
+        response = await loop.run_in_executor(
+            None,
+            lambda: self.client.chat.completions.create(
+                **followup_params,
+                extra_headers={"X-Conversation-Id": conversation_id},
+            ),
+        )
+        logger.debug(f"Harness conversation: {conversation_id}")
+        logger.debug(f"API parameters: {followup_params}")
         logger.debug(f"API response: {response.choices[0].message.content}")
         return response.choices[0].message.content
 

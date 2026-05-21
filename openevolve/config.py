@@ -398,6 +398,101 @@ class EvolutionTraceConfig:
 
 
 @dataclass
+class AgenticFitnessConfig:
+    """Configuration for agentic fitness scoring and research reranking."""
+
+    enabled: bool = False
+    model: Optional[str] = None
+    temperature: float = 0.0
+
+    mode: str = "local_insert"  # local_insert | batch_research | hybrid
+    ranking_pool_top_k: int = 8
+    archive_top_k: int = 4
+    quality_weight: float = 0.65
+    promise_weight: float = 0.25
+    default_fitness_weight: float = 0.10
+
+    research_rerank_interval: int = 50
+    research_rerank_min_pending: int = 16
+    research_scope: str = "all_retained"
+    research_top_k_per_island: int = 12
+    research_include_archive: bool = True
+    research_include_cell_incumbents: bool = True
+    research_include_pending_children: bool = True
+    research_include_migrants: bool = True
+    research_max_programs: int = 128
+    research_num_fitness_functions: int = 3
+    research_function_language: str = "dsl"
+
+    program_context_mode: str = "summary_plus_metrics"
+    program_card_token_budget: int = 700
+    max_validation_cases_per_program: int = 20
+    include_validation_failure_examples: bool = True
+    include_artifact_summaries: bool = True
+    include_lineage_summaries: bool = True
+    include_prior_score_history: bool = True
+
+    normalize_scores: bool = True
+    normalization_method: str = "rank_percentile"
+    score_floor: float = 0.0
+    score_ceiling: float = 1.0
+    apply_research_scores: bool = True
+    rewrite_combined_score: bool = True
+    preserve_score_history: bool = True
+    rebuild_map_elites_after_research: bool = True
+
+    rescore_migrants: bool = True
+    migration_context_top_k: int = 8
+    migration_source_top_k: int = 4
+    migration_target_top_k: int = 8
+    migration_include_cell_incumbent: bool = True
+
+    dump_ranking_events: bool = True
+    dump_research_events: bool = True
+    ranking_events_path: Optional[str] = None
+    research_events_path: Optional[str] = None
+
+    # ACP CDC AI Python harness integration. YAML may use `acp-cdc-ai-python`.
+    acp_cdc_ai_python: bool = False
+    acp_cdc_ai_python_base_url: str = "http://127.0.0.1:8000/v1"
+    acp_cdc_ai_python_cwd: Optional[str] = None
+    acp_cdc_ai_python_env: Dict[str, str] = field(default_factory=dict)
+    acp_cdc_ai_python_mcp_servers: List[Dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class FitnessConfig:
+    """Top-level fitness strategy configuration."""
+
+    algo: str = "default"  # default | agentic
+    agentic: AgenticFitnessConfig = field(default_factory=AgenticFitnessConfig)
+
+    def __post_init__(self) -> None:
+        if self.algo not in {"default", "agentic"}:
+            raise ValueError("fitness.algo must be one of: default, agentic")
+
+        mode = self.agentic.mode
+        if mode not in {"local_insert", "batch_research", "hybrid"}:
+            raise ValueError(
+                "fitness.agentic.mode must be one of: local_insert, batch_research, hybrid"
+            )
+
+        if self.agentic.research_max_programs < 1:
+            raise ValueError("fitness.agentic.research_max_programs must be >= 1")
+        if self.agentic.score_floor >= self.agentic.score_ceiling:
+            raise ValueError("fitness.agentic.score_floor must be less than score_ceiling")
+        if self.agentic.normalization_method not in {"rank_percentile", "minmax", "zscore_sigmoid"}:
+            raise ValueError("fitness.agentic.normalization_method is unsupported")
+        if self.agentic.research_function_language != "dsl":
+            raise ValueError("fitness.agentic.research_function_language must be dsl")
+
+        for name in ("quality_weight", "promise_weight", "default_fitness_weight"):
+            value = getattr(self.agentic, name)
+            if not isinstance(value, (int, float)) or value < 0:
+                raise ValueError(f"fitness.agentic.{name} must be finite and non-negative")
+
+
+@dataclass
 class Config:
     """Master configuration for OpenEvolve"""
 
@@ -416,6 +511,7 @@ class Config:
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     evaluator: EvaluatorConfig = field(default_factory=EvaluatorConfig)
     evolution_trace: EvolutionTraceConfig = field(default_factory=EvolutionTraceConfig)
+    fitness: FitnessConfig = field(default_factory=FitnessConfig)
 
     # Evolution settings
     diff_based_evolution: bool = True
@@ -448,6 +544,11 @@ class Config:
 
     @classmethod
     def from_dict(cls, config_dict: Dict[str, Any]) -> "Config":
+        if "fitness" in config_dict and isinstance(config_dict["fitness"], dict):
+            agentic = config_dict["fitness"].get("agentic")
+            if isinstance(agentic, dict) and "acp-cdc-ai-python" in agentic:
+                agentic["acp_cdc_ai_python"] = agentic.pop("acp-cdc-ai-python")
+
         if "diff_pattern" in config_dict:
             try:
                 re.compile(config_dict["diff_pattern"])

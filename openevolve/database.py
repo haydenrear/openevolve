@@ -47,7 +47,9 @@ class Program:
     # Program identification
     id: str
     code: str
-    changes_description: str = ""  # compact program changes description (via LLM) stored per program
+    changes_description: str = (
+        ""  # compact program changes description (via LLM) stored per program
+    )
     language: str = "python"
 
     # Evolution information
@@ -587,6 +589,166 @@ class ProgramDatabase:
 
         return sorted_programs[:n]
 
+    def create_research_snapshot(
+        self,
+        iteration: int = 0,
+        scope: str = "all_retained",
+        top_k_per_island: int = 12,
+        include_archive: bool = True,
+        include_cell_incumbents: bool = True,
+        include_pending: bool = True,
+        pending_program_ids: Optional[List[str]] = None,
+        max_programs: Optional[int] = None,
+    ):
+        """Create a deterministic snapshot for agentic fitness research."""
+        from openevolve.fitness.research import ResearchSnapshot
+
+        pending_program_ids = [pid for pid in (pending_program_ids or []) if pid in self.programs]
+        selected: List[str] = []
+        seen: Set[str] = set()
+
+        def add_id(program_id: Optional[str]) -> None:
+            if program_id and program_id in self.programs and program_id not in seen:
+                selected.append(program_id)
+                seen.add(program_id)
+
+        if include_pending:
+            for program_id in pending_program_ids:
+                add_id(program_id)
+
+        island_top_program_ids: Dict[int, List[str]] = {}
+        for island_idx in range(len(self.islands)):
+            top_programs = self.get_top_programs(top_k_per_island, island_idx=island_idx)
+            island_top_program_ids[island_idx] = [program.id for program in top_programs]
+            if scope in {"top_per_island", "all_retained"}:
+                for program in top_programs:
+                    add_id(program.id)
+
+        cell_incumbent_ids: List[str] = []
+        if include_cell_incumbents:
+            for island_map in self.island_feature_maps:
+                for program_id in island_map.values():
+                    if program_id in self.programs:
+                        cell_incumbent_ids.append(program_id)
+                        add_id(program_id)
+
+        archive_program_ids = [pid for pid in self.archive if pid in self.programs]
+        if include_archive:
+            for program_id in sorted(
+                archive_program_ids,
+                key=lambda pid: (
+                    -get_fitness_score(self.programs[pid].metrics, self.config.feature_dimensions),
+                    pid,
+                ),
+            ):
+                add_id(program_id)
+
+        if scope == "all_retained":
+            active_ids = set().union(*self.islands) if self.islands else set()
+            active_ids |= set(archive_program_ids)
+            for program_id in sorted(
+                [pid for pid in active_ids if pid in self.programs],
+                key=lambda pid: (
+                    -get_fitness_score(self.programs[pid].metrics, self.config.feature_dimensions),
+                    pid,
+                ),
+            ):
+                add_id(program_id)
+
+        if max_programs is not None:
+            selected = selected[:max_programs]
+
+        target_islands = sorted(
+            {
+                self.programs[program_id].metadata.get("island")
+                for program_id in selected
+                if self.programs[program_id].metadata.get("island") is not None
+            }
+        )
+        return ResearchSnapshot(
+            iteration=iteration,
+            scope=scope,
+            target_islands=target_islands,
+            program_ids=selected,
+            programs_by_id={program_id: self.programs[program_id] for program_id in selected},
+            island_top_program_ids=island_top_program_ids,
+            cell_incumbent_ids=cell_incumbent_ids,
+            archive_program_ids=archive_program_ids,
+            pending_program_ids=pending_program_ids,
+        )
+
+    def apply_score_epoch(self, epoch) -> None:
+        """Apply a score epoch to active programs, preserving score provenance."""
+        function_ids = [spec.function_id for spec in epoch.fitness_function_specs]
+        for update in epoch.updates:
+            program = self.programs.get(update.program_id)
+            if program is None:
+                continue
+            old_score = program.metrics.get("combined_score")
+            if old_score is None:
+                old_score = get_fitness_score(program.metrics, self.config.feature_dimensions)
+            program.metadata.setdefault("fitness_score_history", []).append(
+                {
+                    "epoch_id": epoch.epoch_id,
+                    "previous_combined_score": old_score,
+                    "new_combined_score": update.new_combined_score,
+                    "global_rank": update.global_rank,
+                    "island_rank": update.island_rank,
+                    "normalization": epoch.normalization_spec,
+                    "fitness_function_ids": function_ids,
+                }
+            )
+            program.metrics.setdefault("_default_fitness_score", old_score)
+            program.metrics["_previous_combined_score"] = old_score
+            program.metrics["fitness_research_score"] = update.new_combined_score
+            program.metrics["fitness_research_rank_global"] = update.global_rank
+            if update.island_rank is not None:
+                program.metrics["fitness_research_rank_island"] = update.island_rank
+            program.metrics["fitness_epoch_id"] = epoch.epoch_id
+            program.metrics["agentic_combined_score"] = update.new_combined_score
+            program.metrics["combined_score"] = update.new_combined_score
+            migration = program.metadata.get("migration")
+            if isinstance(migration, dict):
+                migration["rescored_on_arrival"] = True
+                migration["score_epoch_id"] = epoch.epoch_id
+
+    def rebuild_map_elites_from_scores(self, score_key: str = "combined_score") -> None:
+        """Rebuild MAP-Elites cell incumbents after score rewrites."""
+        self.island_feature_maps = [{} for _ in range(len(self.islands))]
+        active_ids: Set[str] = set()
+        for island in self.islands:
+            active_ids.update(pid for pid in island if pid in self.programs)
+
+        def score_tuple(program: Program) -> Tuple[float, float, int, str]:
+            score = program.metrics.get(score_key)
+            if not isinstance(score, (int, float)):
+                score = get_fitness_score(program.metrics, self.config.feature_dimensions)
+            default_score = program.metrics.get("_default_fitness_score", score)
+            created = getattr(program, "iteration_found", 0)
+            return (float(score), float(default_score or 0.0), -int(created or 0), program.id)
+
+        for program_id in sorted(active_ids):
+            program = self.programs[program_id]
+            island_idx = program.metadata.get("island", 0) % len(self.islands)
+            coords = self._calculate_feature_coords(program)
+            feature_key = self._feature_coords_to_key(coords)
+            incumbent_id = self.island_feature_maps[island_idx].get(feature_key)
+            if incumbent_id is None or score_tuple(program) > score_tuple(
+                self.programs[incumbent_id]
+            ):
+                self.island_feature_maps[island_idx][feature_key] = program_id
+
+        retained_programs = [self.programs[pid] for pid in active_ids if pid in self.programs]
+        retained_programs.sort(key=score_tuple, reverse=True)
+        self.archive = {program.id for program in retained_programs[: self.config.archive_size]}
+        self.best_program_id = retained_programs[0].id if retained_programs else None
+        self.island_best_programs = [None] * len(self.islands)
+        for island_idx, island in enumerate(self.islands):
+            island_programs = [self.programs[pid] for pid in island if pid in self.programs]
+            if island_programs:
+                island_programs.sort(key=score_tuple, reverse=True)
+                self.island_best_programs[island_idx] = island_programs[0].id
+
     def save(self, path: Optional[str] = None, iteration: int = 0) -> None:
         """
         Save the database to disk
@@ -1081,9 +1243,7 @@ class ProgramDatabase:
             other = self.programs[pid]
 
             if other.embedding is None:
-                logger.warning(
-                    f"Program {other.id} has no embedding, skipping similarity check"
-                )
+                logger.warning(f"Program {other.id} has no embedding, skipping similarity check")
                 continue
 
             similarity = self._cosine_similarity(embd, other.embedding)
@@ -1777,16 +1937,17 @@ class ProgramDatabase:
         max_generation = max(self.island_generations)
         return (max_generation - self.last_migration_generation) >= self.migration_interval
 
-    def migrate_programs(self) -> None:
+    def migrate_programs(self) -> List[str]:
         """
         Perform migration between islands
 
         This should be called periodically to share good solutions between islands
         """
         if len(self.islands) < 2:
-            return
+            return []
 
         logger.info("Performing migration between islands")
+        migrated_program_ids: List[str] = []
 
         for i, island in enumerate(self.islands):
             if len(island) == 0:
@@ -1858,12 +2019,25 @@ class ProgramDatabase:
                         parent_id=migrant.id,
                         generation=migrant.generation,
                         metrics=migrant.metrics.copy(),
-                        metadata={**migrant.metadata, "island": target_island, "migrant": True},
+                        metadata={
+                            **migrant.metadata,
+                            "island": target_island,
+                            "migrant": True,
+                            "migration": {
+                                "source_program_id": migrant.id,
+                                "source_island": i,
+                                "target_island": target_island,
+                                "arrived_iteration": self.last_iteration,
+                                "rescored_on_arrival": False,
+                                "score_epoch_id": None,
+                            },
+                        },
                     )
 
                     # Use add() method to properly handle MAP-Elites deduplication,
                     # feature map updates, and island tracking
                     self.add(migrant_copy, target_island=target_island)
+                    migrated_program_ids.append(migrant_copy.id)
 
                     # Log migration
                     logger.info(
@@ -1878,6 +2052,7 @@ class ProgramDatabase:
 
         # Validate migration results
         self._validate_migration_results()
+        return migrated_program_ids
 
     def _validate_migration_results(self) -> None:
         """
